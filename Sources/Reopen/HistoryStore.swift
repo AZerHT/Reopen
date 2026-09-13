@@ -2,9 +2,11 @@ import Foundation
 
 struct WindowState: Codable, Equatable {
     let title: String
-    /// The file or folder the window showed; nil for a window without one (Spotify, Messages…).
+    /// The file or folder the window showed — or the copy Reopen saved of an untitled document.
+    /// Nil for a window without one (Spotify, Messages…).
     let documentURL: URL?
     let frame: CGRect?
+    var viewState: ViewState?
 }
 
 /// A closed window, or a quit app with the windows it had.
@@ -16,6 +18,8 @@ struct ClosedItem: Codable, Identifiable, Equatable {
     let windows: [WindowState]
     let appQuit: Bool
     let closedAt: Date
+    /// Set while the window is only hidden by soft close, and can come back as it is.
+    var softCloseToken: UUID?
 
     var menuTitle: String {
         guard appQuit else { return "\(windows.first?.title ?? appName) — \(appName)" }
@@ -25,7 +29,7 @@ struct ClosedItem: Codable, Identifiable, Equatable {
     /// An uninstalled app, or a closed window whose file was deleted, can't come back.
     var isAvailable: Bool {
         guard FileManager.default.fileExists(atPath: appURL.path) else { return false }
-        if appQuit { return true }
+        if appQuit || softCloseToken != nil { return true }
         return windows.allSatisfy { state in
             state.documentURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? true
         }
@@ -45,15 +49,23 @@ final class HistoryStore {
         fileURL = directory.appendingPathComponent("history.json")
         if let data = try? Data(contentsOf: fileURL),
            let saved = try? JSONDecoder().decode([ClosedItem].self, from: data) {
-            items = saved
+            // Soft closes don't survive a restart: their windows were closed for real.
+            items = saved.map { item in
+                var item = item
+                item.softCloseToken = nil
+                return item
+            }
         }
     }
 
     func push(_ item: ClosedItem) {
         // The same document closed twice, or the same app quit twice, keeps only its latest entry.
+        // Windows without a document can't be told apart, so they all stay.
         items.removeAll { old in
-            old.bundleID == item.bundleID && old.appQuit == item.appQuit
-                && (item.appQuit || old.windows.first?.documentURL?.matchKey == item.windows.first?.documentURL?.matchKey)
+            guard old.bundleID == item.bundleID, old.appQuit == item.appQuit, old.softCloseToken == nil else { return false }
+            if item.appQuit { return true }
+            guard let key = item.windows.first?.documentURL?.matchKey else { return false }
+            return old.windows.first?.documentURL?.matchKey == key
         }
         items.insert(item, at: 0)
         if items.count > limit { items.removeLast(items.count - limit) }
@@ -73,6 +85,12 @@ final class HistoryStore {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return nil }
         defer { save() }
         return items.remove(at: index)
+    }
+
+    /// A soft-closed window came back on screen by itself: it isn't closed any more.
+    func remove(softCloseToken token: UUID) {
+        items.removeAll { $0.softCloseToken == token }
+        save()
     }
 
     func clear() {

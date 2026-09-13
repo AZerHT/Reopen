@@ -12,6 +12,26 @@ extension AXUIElement {
         value(of: attribute) as? String
     }
 
+    func element(_ attribute: String) -> AXUIElement? {
+        guard let value = value(of: attribute), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    func bool(_ attribute: String) -> Bool? {
+        (value(of: attribute) as? NSNumber)?.boolValue
+    }
+
+    var children: [AXUIElement] {
+        (value(of: kAXChildrenAttribute) as? [AXUIElement]) ?? []
+    }
+
+    /// A native tab bar holding several tabs: there ⌘W closes a tab, not the window.
+    var hasSeveralTabs: Bool {
+        children.contains { child in
+            child.string(kAXRoleAttribute) == kAXTabGroupRole && ((child.value(of: kAXTabsAttribute) as? [AXUIElement])?.count ?? 0) > 1
+        }
+    }
+
     var pid: pid_t? {
         var pid: pid_t = 0
         return AXUIElementGetPid(self, &pid) == .success ? pid : nil
@@ -40,6 +60,24 @@ extension AXUIElement {
         var extent = CGSize.zero
         guard AXValueGetValue(position, .cgPoint, &point), AXValueGetValue(size, .cgSize, &extent) else { return nil }
         return CGRect(origin: point, size: extent)
+    }
+
+    /// Brings the window to the front of its app and its app to the front, on whatever Space it is.
+    func focus(pid: pid_t) {
+        AXUIElementSetMessagingTimeout(self, 0.3)
+        if bool(kAXMinimizedAttribute) == true {
+            AXUIElementSetAttributeValue(self, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        }
+        AXUIElementSetAttributeValue(self, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(self, kAXRaiseAction as CFString)
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(pid), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        NSRunningApplication(processIdentifier: pid)?.activate(options: [])
+    }
+
+    func setPosition(_ origin: CGPoint) {
+        var point = origin
+        guard let position = AXValueCreate(.cgPoint, &point) else { return }
+        AXUIElementSetAttributeValue(self, kAXPositionAttribute as CFString, position)
     }
 
     func setFrame(_ frame: CGRect) {

@@ -1,11 +1,27 @@
 import AppKit
 import ApplicationServices
 
-/// Brings back a closed window, or a quit app with its windows, then puts the windows back where they were.
+/// Brings back a closed window, or a quit app with its windows, then puts each window back where it was
+/// and scrolls it back to where it was.
 final class Reopener {
     func reopen(_ item: ClosedItem) {
         let documents = item.windows.compactMap(\.documentURL).filter { FileManager.default.fileExists(atPath: $0.path) }
         DebugLog.write("reopening \(item.menuTitle) (\(documents.count) documents)")
+        let running = NSWorkspace.shared.runningApplications.first { $0.bundleURL?.standardizedFileURL == item.appURL.standardizedFileURL }
+
+        // A window without a document, from an app that still has others: ask the app for a new window.
+        if !item.appQuit, documents.isEmpty, let app = running {
+            let existing = AXUIElementCreateApplication(app.processIdentifier).windows.filter(\.isStandardWindow)
+            if !existing.isEmpty {
+                app.activate(options: [])
+                if AppMenu.pressNewWindow(pid: app.processIdentifier) {
+                    DebugLog.write("asked \(item.appName) for a new window")
+                    FrameRestorer(windows: item.windows, pid: app.processIdentifier, excluding: existing).start()
+                    return
+                }
+                DebugLog.write("\(item.appName) has no New Window command")
+            }
+        }
 
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
@@ -17,7 +33,7 @@ final class Reopener {
                     return
                 }
                 guard let app else { return }
-                FrameRestorer(windows: item.windows, pid: app.processIdentifier).start()
+                FrameRestorer(windows: item.windows, pid: app.processIdentifier, excluding: []).start()
             }
         }
 
@@ -30,16 +46,18 @@ final class Reopener {
     }
 }
 
-/// The app opens its windows asynchronously: poll until each saved window has a match, then move it into place.
+/// The app opens its windows asynchronously: poll until each saved window has a match, then put it in place.
 private final class FrameRestorer {
     private var pending: [WindowState]
-    private var placed: [AXUIElement] = []
+    /// Windows already matched, or that existed before the reopen.
+    private var placed: [AXUIElement]
     private let pid: pid_t
     private let deadline = Date().addingTimeInterval(5)
 
-    init(windows: [WindowState], pid: pid_t) {
+    init(windows: [WindowState], pid: pid_t, excluding existing: [AXUIElement]) {
         // Documents first: they can be told apart, windows without one only take what is left.
-        pending = windows.filter { $0.frame != nil }.sorted { $0.documentURL != nil && $1.documentURL == nil }
+        pending = windows.sorted { $0.documentURL != nil && $1.documentURL == nil }
+        placed = existing
         self.pid = pid
     }
 
@@ -48,9 +66,11 @@ private final class FrameRestorer {
             window.isStandardWindow && !placed.contains { CFEqual($0, window) }
         }
         pending.removeAll { state in
-            guard let frame = state.frame, let index = matchIndex(for: state, in: available) else { return false }
-            available[index].setFrame(frame)
-            placed.append(available.remove(at: index))
+            guard let index = matchIndex(for: state, in: available) else { return false }
+            let window = available.remove(at: index)
+            if let frame = state.frame { window.setFrame(frame) }
+            if let viewState = state.viewState { ViewStateRestorer(state: viewState, window: window).start() }
+            placed.append(window)
             return true
         }
         guard !pending.isEmpty, Date() < deadline else { return }
@@ -66,5 +86,28 @@ private final class FrameRestorer {
         let title = FileManager.default.displayName(atPath: documentURL.path)
         return windows.firstIndex { $0.documentURL?.matchKey == key }
             ?? windows.firstIndex { $0.documentURL == nil && $0.string(kAXTitleAttribute) == title }
+    }
+}
+
+/// A reopened window fills in its content a moment after it appears: retry a few times.
+private final class ViewStateRestorer {
+    private let state: ViewState
+    private let window: AXUIElement
+    private var attempts = 0
+
+    init(state: ViewState, window: AXUIElement) {
+        self.state = state
+        self.window = window
+    }
+
+    func start() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            self.attempts += 1
+            if ViewStateAccess.apply(self.state, to: self.window) {
+                DebugLog.write("restored scroll/selection")
+            } else if self.attempts < 6 {
+                self.start()
+            }
+        }
     }
 }
