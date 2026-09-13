@@ -6,6 +6,8 @@
     <string>Reopen</string>
     <key>CFBundleIdentifier</key>
     <string>io.github.azerht.reopen</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleName</key>
     <string>Reopen</string>
     <key>CFBundleDisplayName</key>

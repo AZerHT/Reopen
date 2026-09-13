@@ -1,6 +1,8 @@
-# Reopen
+<p align="center"><img src="docs/icon.png" width="160" alt="Reopen icon"></p>
 
-**⇧⌘T for every window on your Mac.**
+<h1 align="center">Reopen</h1>
+
+<p align="center"><b>⇧⌘T for every window on your Mac.</b></p>
 
 Closed a Finder folder three levels deep? A PDF in Preview? A project in Xcode? Press ⇧⌘T and it comes back — same document, same place, same screen.
 

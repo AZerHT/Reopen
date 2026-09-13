@@ -26,6 +26,11 @@ rm -rf "$APP"
 mkdir -p "${APP}/Contents/MacOS"
 cp "$BIN" "${APP}/Contents/MacOS/Reopen"
 cp Resources/Info.plist "${APP}/Contents/Info.plist"
+if [[ ! -f Resources/AppIcon.icns ]]; then
+    ./Tools/make-icon.sh >/dev/null
+fi
+mkdir -p "${APP}/Contents/Resources"
+cp Resources/AppIcon.icns "${APP}/Contents/Resources/AppIcon.icns"
 
 # Ad-hoc by default: every rebuild changes the signature, so macOS forgets the Accessibility grant.
 # Set SIGN_IDENTITY to a local code signing certificate to keep the grant across rebuilds.
