@@ -12,7 +12,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settingsWindow = SettingsWindowController()
     private var statusItem: NSStatusItem!
     private var permissionTimer: Timer?
+    private var inputStateTimer: Timer?
+    /// Every keystroke and click waits on the event tap: App Nap must never slow this windowless app down.
+    private var latencyCriticalActivity: NSObjectProtocol?
     private let ownBundleID = Bundle.main.bundleIdentifier
+
+    /// The frontmost app's close buttons, matched against the clicks the event tap reports.
+    private struct CloseButtonTarget {
+        let rect: CGRect
+        let window: AXUIElement
+        let button: AXUIElement
+        let pid: pid_t
+    }
+    private var closeButtonTargets: [CloseButtonTarget] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -56,8 +68,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startWatching() {
+        latencyCriticalActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+            reason: "Event tap on keystrokes and clicks"
+        )
         tracker.start()
+        refreshInputState()
         DebugLog.write("event tap started = \(interceptor.start())")
+        // The event tap decides from this snapshot: keep it current without ever making the tap wait.
+        inputStateTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+            self?.refreshInputState()
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshInputState()
+        }
+    }
+
+    private func refreshInputState() {
+        var state = InputInterceptor.State()
+        state.shortcut = settings.shortcut
+        state.backShortcut = settings.backShortcut
+        state.forwardShortcut = settings.forwardShortcut
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        state.frontmostPID = frontmost?.processIdentifier ?? 0
+        state.frontmostIsSelf = frontmost == nil || frontmost?.bundleIdentifier == ownBundleID
+        state.frontmostLeavesShortcut = settings.leavesShortcut(to: frontmost?.bundleIdentifier)
+        state.hasHistory = !store.items.isEmpty
+        state.canGoBack = history.canGoBack
+        state.canGoForward = history.canGoForward
+        state.softCloseEnabled = settings.softCloseEnabled
+
+        var targets: [CloseButtonTarget] = []
+        if let frontmost, !state.frontmostIsSelf, AXIsProcessTrusted() {
+            let pid = frontmost.processIdentifier
+            let app = AXUIElementCreateApplication(pid)
+            // Polled on the main thread: a busy app must not stall Reopen.
+            AXUIElementSetMessagingTimeout(app, 0.1)
+            for window in app.windows {
+                AXUIElementSetMessagingTimeout(window, 0.1)
+                guard window.isStandardWindow, let button = window.element(kAXCloseButtonAttribute) else { continue }
+                AXUIElementSetMessagingTimeout(button, 0.1)
+                if let rect = button.frame {
+                    targets.append(CloseButtonTarget(rect: rect, window: window, button: button, pid: pid))
+                }
+            }
+        }
+        closeButtonTargets = targets
+        state.closeButtons = targets.map(\.rect)
+        interceptor.update(state)
     }
 
     private func connect() {
@@ -68,32 +126,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         softCloser.willCloseForReal = { [weak self] element in self?.tracker.expectDestroy(element) }
         softCloser.didPutBack = { [weak self] token in self?.store.remove(softCloseToken: token) }
 
-        interceptor.onShortcut = { [weak self] in self?.shortcutPressed() ?? false }
-        interceptor.onHistory = { [weak self] back in self?.historyPressed(back: back) ?? false }
-        interceptor.onCloseKey = { [weak self] pid in self?.closeKeyPressed(pid: pid) ?? false }
-        interceptor.onCloseButton = { [weak self] window, pid in self?.closeButtonClicked(window, pid: pid) ?? false }
+        interceptor.onReopen = { [weak self] in self?.reopenLast() }
+        interceptor.onHistory = { [weak self] back in self?.goThroughHistory(back: back) }
+        interceptor.onCloseKey = { [weak self] pid in self?.closeKeyHeldBack(pid: pid) }
+        interceptor.onCloseButton = { [weak self] point, heldBack in self?.closeButtonClicked(at: point, heldBack: heldBack) }
         interceptor.onQuitKey = { [weak self] pid in self?.tracker.captureBeforeQuit(pid: pid) }
     }
 
     // MARK: - Input
 
-    private func shortcutPressed() -> Bool {
-        let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        guard bundleID != ownBundleID, !settings.leavesShortcut(to: bundleID) else { return false }
-        // With nothing to reopen, the keystroke goes on to the app (Finder's Show Tab Bar).
-        guard !store.items.isEmpty else { return false }
-        DispatchQueue.main.async { self.reopenLast() }
-        return true
-    }
-
-    /// Called from the event tap: only cheap checks here, the Accessibility work runs just after.
-    private func historyPressed(back: Bool) -> Bool {
-        guard back ? history.canGoBack : history.canGoForward else { return false }
-        DispatchQueue.main.async { self.goThroughHistory(back: back) }
-        return true
-    }
-
     private func goThroughHistory(back: Bool) {
+        defer { refreshInputState() }
         let isUsable: (WindowHistory.Entry) -> Bool = { [softCloser] entry in !softCloser.isHidden(entry.element) }
         guard let entry = back ? history.back(isUsable: isUsable) : history.forward(isUsable: isUsable) else {
             DebugLog.write("history: nothing to go \(back ? "back" : "forward") to")
@@ -113,25 +156,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         goThroughHistory(back: false)
     }
 
-    private func closeKeyPressed(pid: pid_t) -> Bool {
-        guard let window = WindowTracker.focusedWindow(pid: pid), window.isStandardWindow else { return false }
-        let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
-        guard bundleID != ownBundleID else { return false }
-        // ⌘W closes a tab in tabbed windows and in the apps that keep the shortcut: no soft close there.
-        if settings.softCloseEnabled, !settings.leavesShortcut(to: bundleID), !window.hasSeveralTabs {
-            return softClose(window, pid: pid)
+    /// ⌘W, held back by the event tap so the window can be read before it closes. It always reaches the app
+    /// afterwards, unless the window was soft-closed instead.
+    private func closeKeyHeldBack(pid: pid_t) {
+        if let window = WindowTracker.focusedWindow(pid: pid), window.isStandardWindow {
+            // ⌘W closes a tab in tabbed windows: no soft close there.
+            if settings.softCloseEnabled, !window.hasSeveralTabs, softClose(window, pid: pid) {
+                return
+            }
+            tracker.captureBeforeClose(window, pid: pid)
         }
-        tracker.captureBeforeClose(window, pid: pid)
-        return false
+        InputInterceptor.replayCloseKey()
     }
 
-    private func closeButtonClicked(_ window: AXUIElement, pid: pid_t) -> Bool {
-        guard window.isStandardWindow, NSRunningApplication(processIdentifier: pid)?.bundleIdentifier != ownBundleID else { return false }
-        if settings.softCloseEnabled {
-            return softClose(window, pid: pid)
+    private func closeButtonClicked(at point: CGPoint, heldBack: Bool) {
+        guard let target = closeButtonTargets.first(where: { $0.rect.insetBy(dx: -2, dy: -2).contains(point) }) else {
+            // The window moved or went away since the last snapshot: the click must still happen.
+            if heldBack { InputInterceptor.replayClick(at: point) }
+            return
         }
-        tracker.captureBeforeClose(window, pid: pid)
-        return false
+        guard heldBack else {
+            tracker.captureBeforeClose(target.window, pid: target.pid)
+            return
+        }
+        if softClose(target.window, pid: target.pid) { return }
+        // Not hidden (an app using audio, say): close it, as the click would have.
+        AXUIElementPerformAction(target.button, kAXPressAction as CFString)
     }
 
     /// Hides the window instead of letting it close. False lets the close go ahead.
@@ -152,6 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Reopening
 
     private func reopenLast() {
+        defer { refreshInputState() }
         DebugLog.write("reopen requested, \(store.items.count) in history")
         guard let item = store.popLatestAvailable() else {
             NSSound.beep()
